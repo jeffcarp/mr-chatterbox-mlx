@@ -212,6 +212,7 @@ async def generate_stream_tokens(
     max_tokens: int = 512,
     stop_token_ids: Optional[Set[int]] = None,
     max_sequence_length: int = 2048,
+    filter_acts: bool = True,
 ) -> AsyncGenerator[str, None]:
     """Asynchronously generates streamed token pieces from prompt using compiled MLX decoding."""
     import asyncio
@@ -264,7 +265,11 @@ async def generate_stream_tokens(
             break
 
         piece = tokenizer.detokenize([next_token])
-        if piece and not piece.startswith("<|"):
+        if (
+            piece
+            and not piece.startswith("<|")
+            and not (filter_acts and piece.startswith("<act:"))
+        ):
             yield piece
             # Yield control back to asyncio event loop
             await asyncio.sleep(0)
@@ -285,6 +290,7 @@ def generate_full_text(
     max_tokens: int = 512,
     stop_token_ids: Optional[Set[int]] = None,
     max_sequence_length: int = 2048,
+    filter_acts: bool = True,
 ) -> str:
     """Synchronously generates the full response string for prompt."""
     import keras
@@ -330,7 +336,9 @@ def generate_full_text(
         if next_token in stop_token_ids:
             break
 
-        generated_ids.append(next_token)
+        piece = tokenizer.detokenize([next_token])
+        if not (filter_acts and piece.startswith("<act:")):
+            generated_ids.append(next_token)
 
         token_tensor = mx.reshape(
             mx.array(next_token, dtype=current_prompt.dtype), (1, 1)

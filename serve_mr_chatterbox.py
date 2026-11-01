@@ -43,14 +43,14 @@ active_preprocessor: Any = None
 formatter = MrChatterboxFormatter()
 stop_token_ids: Set[int] = set()
 model_id_name: str = "mr-chatterbox"
-clean_acts_enabled: bool = False
+clean_acts_enabled: bool = True
 
 
 def init_server_model(
     repo_or_path: str = DEFAULT_HF_REPO,
     dtype: str = "bfloat16",
     compile_metal: bool = True,
-    clean_acts: bool = False,
+    clean_acts: bool = True,
 ):
     """Initializes and caches the Mr. Chatterbox model instance."""
     global \
@@ -187,6 +187,7 @@ async def chat_completions(request: Request):
                     prompt=prompt,
                     max_tokens=max_tokens,
                     stop_token_ids=stop_token_ids,
+                    filter_acts=clean_acts_enabled,
                 ):
                     full_chunks.append(piece)
                     chunk_payload = {
@@ -247,6 +248,7 @@ async def chat_completions(request: Request):
             prompt=prompt,
             max_tokens=max_tokens,
             stop_token_ids=stop_token_ids,
+            filter_acts=clean_acts_enabled,
         )
 
         if clean_acts_enabled:
@@ -309,17 +311,23 @@ def main():
         help="Disable mx.compile Metal kernel fusion",
     )
     parser.add_argument(
+        "--keep-acts",
+        action="store_true",
+        help="Preserve raw dialogue act tags (<act:...>) in responses (default: clean them)",
+    )
+    parser.add_argument(
         "--clean-acts",
         action="store_true",
-        help="Strip leading dialogue acts (<act:...>) in responses",
+        help="Explicitly strip leading dialogue acts (<act:...>) in responses (default: True)",
     )
     args = parser.parse_args()
 
+    clean_acts = not args.keep_acts
     init_server_model(
         repo_or_path=args.model,
         dtype=args.dtype,
         compile_metal=not args.no_compile,
-        clean_acts=args.clean_acts,
+        clean_acts=clean_acts,
     )
 
     asyncio.run(warmup_server())
