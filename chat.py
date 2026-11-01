@@ -64,6 +64,9 @@ async def run_chat_loop(
     max_tokens: int = 512,
     stop_token_ids: Optional[Set[int]] = None,
     max_sequence_length: int = 2048,
+    temperature: float = 0.3,
+    top_k: int = 50,
+    repetition_penalty: float = 1.3,
 ):
     """Interactive REPL loop for terminal chat."""
     print(f"\n{BOLD}{CYAN}🎩 Welcome to Mr. Chatterbox! 🎩{RESET}")
@@ -120,6 +123,10 @@ async def run_chat_loop(
                 max_tokens=max_tokens,
                 stop_token_ids=stop_token_ids,
                 max_sequence_length=max_sequence_length,
+                filter_acts=False,
+                temperature=temperature,
+                top_k=top_k,
+                repetition_penalty=repetition_penalty,
             ):
                 full_response_parts.append(piece)
 
@@ -177,6 +184,18 @@ def main():
         help="Max tokens per generation turn (default: 512)",
     )
     parser.add_argument(
+        "--temperature",
+        type=float,
+        default=0.3,
+        help="Sampling temperature (default: 0.3)",
+    )
+    parser.add_argument(
+        "--repetition-penalty",
+        type=float,
+        default=1.3,
+        help="Repetition penalty factor (default: 1.3)",
+    )
+    parser.add_argument(
         "--no-compile",
         action="store_true",
         help="Disable mx.compile Metal kernel fusion",
@@ -201,6 +220,8 @@ def main():
             tokenizer=tokenizer,
             session=session,
             max_tokens=args.max_tokens,
+            temperature=args.temperature,
+            repetition_penalty=args.repetition_penalty,
         )
     )
 

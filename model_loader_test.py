@@ -34,3 +34,25 @@ def test_download_model_if_needed_existing_path(tmp_path):
     import os
     os.makedirs(local_dir, exist_ok=True)
     assert download_model_if_needed(local_dir) == local_dir
+
+
+def test_sample_token_mlx_argmax():
+    import mlx.core as mx
+    from model_loader import sample_token_mlx
+
+    logits = mx.array([[[1.0, 5.0, 2.0]]])
+    # Temperature 0 => pure argmax
+    token = sample_token_mlx(logits, context_ids=[], temperature=0.0)
+    assert token == 1
+
+
+def test_sample_token_mlx_repetition_penalty():
+    import mlx.core as mx
+    from model_loader import sample_token_mlx
+
+    # Token 1 has logit 5.0, Token 2 has logit 4.5
+    logits = mx.array([[[1.0, 5.0, 4.5]]])
+    # If token 1 is in context_ids with repetition penalty 2.0, its logit drops to 2.5
+    # Token 2 (4.5) will now be highest
+    token = sample_token_mlx(logits, context_ids=[1], temperature=0.0, repetition_penalty=2.0)
+    assert token == 2

@@ -152,9 +152,31 @@ async def chat_completions(request: Request):
     model_name = body.get("model", "mr-chatterbox")
     req_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
 
+    # Extract generation hyperparameters with defaults from model generation_config
+    body_temp = body.get("temperature")
+    try:
+        temperature = float(body_temp) if body_temp is not None else 0.3
+    except (ValueError, TypeError):
+        temperature = 0.3
+
+    body_top_k = body.get("top_k")
+    try:
+        top_k = int(body_top_k) if body_top_k is not None else 50
+    except (ValueError, TypeError):
+        top_k = 50
+
+    body_rep_penalty = body.get("repetition_penalty")
+    try:
+        repetition_penalty = float(body_rep_penalty) if body_rep_penalty is not None else 1.3
+    except (ValueError, TypeError):
+        repetition_penalty = 1.3
+
     prompt = formatter.format_chat(messages, add_generation_prompt=True)
 
-    print(f"\n--- [REQUEST] messages: {len(messages)}, max_tokens: {max_tokens}, stream: {stream}")
+    print(
+        f"\n--- [REQUEST] messages: {len(messages)}, max_tokens: {max_tokens}, "
+        f"temp: {temperature}, rep_penalty: {repetition_penalty}, stream: {stream}"
+    )
     if messages:
         last_msg = messages[-1]
         print(f"  Last user message: {repr(last_msg.get('content'))[:100]}")
@@ -188,6 +210,9 @@ async def chat_completions(request: Request):
                     max_tokens=max_tokens,
                     stop_token_ids=stop_token_ids,
                     filter_acts=clean_acts_enabled,
+                    temperature=temperature,
+                    top_k=top_k,
+                    repetition_penalty=repetition_penalty,
                 ):
                     full_chunks.append(piece)
                     chunk_payload = {
@@ -249,6 +274,9 @@ async def chat_completions(request: Request):
             max_tokens=max_tokens,
             stop_token_ids=stop_token_ids,
             filter_acts=clean_acts_enabled,
+            temperature=temperature,
+            top_k=top_k,
+            repetition_penalty=repetition_penalty,
         )
 
         if clean_acts_enabled:

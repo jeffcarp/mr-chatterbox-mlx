@@ -205,6 +205,39 @@ def compute_sequence_length(
     return min(((needed + 511) // 512) * 512, max_sequence_length)
 
 
+def sample_token_mlx(
+    logits: Any,
+    context_ids: Optional[List[int]] = None,
+    temperature: float = 0.3,
+    top_k: int = 50,
+    repetition_penalty: float = 1.3,
+) -> int:
+    """Samples next token from logits with repetition penalty, temperature, and top-k filtering in MLX."""
+    import mlx.core as mx
+
+    l = logits[0, 0].astype(mx.float32)
+
+    # Apply repetition penalty to recently observed tokens
+    if repetition_penalty != 1.0 and context_ids:
+        unique_ids = list(set(context_ids))
+        indices = mx.array(unique_ids, dtype=mx.int32)
+        vals = l[indices]
+        new_vals = mx.where(vals > 0, vals / repetition_penalty, vals * repetition_penalty)
+        l[indices] = new_vals
+
+    if temperature <= 0.01:
+        return int(mx.argmax(l).item())
+
+    l = l / temperature
+    if 0 < top_k < l.shape[0]:
+        top_indices = mx.argpartition(-l, kth=top_k)[:top_k]
+        mask = mx.full(l.shape, -1e9, dtype=mx.float32)
+        mask[top_indices] = l[top_indices]
+        l = mask
+
+    return int(mx.random.categorical(l).item())
+
+
 async def generate_stream_tokens(
     model: Any,
     tokenizer: Any,
@@ -213,6 +246,9 @@ async def generate_stream_tokens(
     stop_token_ids: Optional[Set[int]] = None,
     max_sequence_length: int = 2048,
     filter_acts: bool = True,
+    temperature: float = 0.3,
+    top_k: int = 50,
+    repetition_penalty: float = 1.3,
 ) -> AsyncGenerator[str, None]:
     """Asynchronously generates streamed token pieces from prompt using compiled MLX decoding."""
     import asyncio
@@ -248,6 +284,9 @@ async def generate_stream_tokens(
     index = prompt_tokens
     max_len = min(prompt_tokens + max_tokens, seq_len)
 
+    # Track recent context tokens for repetition penalty
+    context_tokens: List[int] = list(raw_tokens[-128:].tolist())
+
     while index < max_len:
         cache_update_index = index - 1
         prompt_slice = keras.ops.slice(current_prompt, [0, cache_update_index], [1, 1])
@@ -260,9 +299,17 @@ async def generate_stream_tokens(
         )
         mx.eval(logits, current_cache)
 
-        next_token = int(mx.argmax(logits[:, 0, :], axis=-1).item())
+        next_token = sample_token_mlx(
+            logits=logits,
+            context_ids=context_tokens,
+            temperature=temperature,
+            top_k=top_k,
+            repetition_penalty=repetition_penalty,
+        )
         if next_token in stop_token_ids:
             break
+
+        context_tokens.append(next_token)
 
         piece = tokenizer.detokenize([next_token])
         if (
@@ -291,6 +338,9 @@ def generate_full_text(
     stop_token_ids: Optional[Set[int]] = None,
     max_sequence_length: int = 2048,
     filter_acts: bool = True,
+    temperature: float = 0.3,
+    top_k: int = 50,
+    repetition_penalty: float = 1.3,
 ) -> str:
     """Synchronously generates the full response string for prompt."""
     import keras
@@ -319,6 +369,7 @@ def generate_full_text(
     max_len = min(prompt_tokens + max_tokens, seq_len)
 
     generated_ids: List[int] = []
+    context_tokens: List[int] = list(raw_tokens[-128:].tolist())
 
     while index < max_len:
         cache_update_index = index - 1
@@ -332,9 +383,17 @@ def generate_full_text(
         )
         mx.eval(logits, current_cache)
 
-        next_token = int(mx.argmax(logits[:, 0, :], axis=-1).item())
+        next_token = sample_token_mlx(
+            logits=logits,
+            context_ids=context_tokens,
+            temperature=temperature,
+            top_k=top_k,
+            repetition_penalty=repetition_penalty,
+        )
         if next_token in stop_token_ids:
             break
+
+        context_tokens.append(next_token)
 
         piece = tokenizer.detokenize([next_token])
         if not (filter_acts and piece.startswith("<act:")):
