@@ -1,0 +1,343 @@
+"""Model loader and MLX generation engine for Mr. Chatterbox.
+
+Loads Mr. Chatterbox models (e.g. tventurella/Mr.Chatterbox-2.7B-Chat) into KerasHub
+backed by Apple Silicon Metal GPU acceleration via the keras-mlx pluggable backend.
+"""
+
+import atexit
+import json
+import os
+import time
+from typing import Any, AsyncGenerator, Dict, List, Optional, Set, Tuple
+
+# Ensure Keras backend is MLX prior to importing keras/keras_hub
+os.environ.setdefault("KERAS_BACKEND", "mlx")
+
+DEFAULT_HF_REPO = "tventurella/Mr.Chatterbox-2.7B-Chat"
+KNOWN_MODELS = {
+    "2.7b": "tventurella/Mr.Chatterbox-2.7B-Chat",
+    "2.7b-base": "tventurella/Mr.Chatterbox-2.7B",
+    "1.2b": "tventurella/Mr.Chatterbox-1.2B",
+    "500m": "tventurella/Mr.Chatterbox-500M",
+    "345m": "tventurella/Mr.Chatterbox-345M",
+}
+
+
+def _register_tf_mlx_converter():
+    """Registers mlx.core.array converter for TensorFlow to support KerasHub tokenizers."""
+    try:
+        import mlx.core as mx
+        import numpy as np
+        import tensorflow as tf
+
+        tf.register_tensor_conversion_function(
+            mx.array,
+            lambda val, dtype=None, name=None, as_ref=False: tf.convert_to_tensor(
+                np.array(val), dtype=dtype, name=name
+            ),
+        )
+    except Exception:
+        pass
+
+
+def download_model_if_needed(repo_or_path: str) -> str:
+    """Downloads model files from Hugging Face Hub if repo_or_path is a HF repo ID.
+
+    Returns the local path containing model snapshot.
+    """
+    if os.path.exists(repo_or_path):
+        return repo_or_path
+
+    # Check shorthand alias
+    repo_id = KNOWN_MODELS.get(repo_or_path.lower(), repo_or_path)
+
+    # Strip hf:// prefix if provided
+    if repo_id.startswith("hf://"):
+        repo_id = repo_id[5:]
+
+    from huggingface_hub import snapshot_download
+
+    print(f"Checking/downloading model weights from Hugging Face: {repo_id}...")
+    local_dir = snapshot_download(
+        repo_id=repo_id,
+        allow_patterns=[
+            "config.json",
+            "generation_config.json",
+            "tokenizer.json",
+            "tokenizer_config.json",
+            "*.safetensors",
+        ],
+    )
+    print(f"Model snapshot located at: {local_dir}")
+    return local_dir
+
+
+def load_tokenizer_and_preprocessor(
+    snapshot_path: str,
+    sequence_length: int = 2048,
+):
+    """Loads and configures the BytePairTokenizer with special tokens for Mr. Chatterbox."""
+    from keras_hub.src.models.llama3.llama3_causal_lm_preprocessor import (
+        Llama3CausalLMPreprocessor,
+    )
+    from keras_hub.src.models.llama3.llama3_tokenizer import Llama3Tokenizer
+    from keras_hub.src.utils.preset_utils import load_json
+
+    tok_path = os.path.join(snapshot_path, "tokenizer.json")
+    cfg_path = os.path.join(snapshot_path, "tokenizer_config.json")
+
+    with open(tok_path, "r", encoding="utf-8") as f:
+        tok_data = json.load(f)
+
+    vocab = tok_data["model"]["vocab"]
+    merges = tok_data["model"]["merges"]
+    if merges and isinstance(merges[0], list) and len(merges[0]) == 2:
+        merges = [" ".join(m) for m in merges]
+
+    special_tokens = set()
+    for item in tok_data.get("added_tokens", []):
+        content = item.get("content")
+        if content and not content.startswith("<|reserved_special_token_"):
+            vocab[content] = item["id"]
+            special_tokens.add(content)
+
+    bos_token = None
+    eos_token = "<|endoftext|>"
+    if os.path.exists(cfg_path):
+        with open(cfg_path, "r", encoding="utf-8") as f:
+            cfg_data = json.load(f)
+            bos_token = cfg_data.get("bos_token")
+            eos_token = cfg_data.get("eos_token") or "<|endoftext|>"
+
+    misc_tokens = {t for t in special_tokens if t in vocab}
+    if bos_token:
+        misc_tokens.discard(bos_token)
+    if eos_token:
+        misc_tokens.discard(eos_token)
+
+    tokenizer = Llama3Tokenizer(
+        vocabulary=vocab,
+        merges=merges,
+        bos_token=bos_token,
+        eos_token=eos_token,
+        misc_special_tokens=misc_tokens,
+    )
+
+    preprocessor = Llama3CausalLMPreprocessor(
+        tokenizer=tokenizer,
+        sequence_length=sequence_length,
+        add_start_token=False,
+        add_end_token=False,
+    )
+    return tokenizer, preprocessor
+
+
+def load_mr_chatterbox(
+    repo_or_path: str = DEFAULT_HF_REPO,
+    dtype: str = "bfloat16",
+    compile_metal: bool = True,
+    max_sequence_length: int = 2048,
+) -> Tuple[Any, Any, Any]:
+    """Loads Mr. Chatterbox model into KerasHub with MLX backend.
+
+    Args:
+        repo_or_path: Hugging Face repo ID (e.g. 'tventurella/Mr.Chatterbox-2.7B-Chat')
+                      or local directory containing model snapshot.
+        dtype: Compute precision ('bfloat16', 'float16', 'float32').
+        compile_metal: Whether to compile call_with_cache using mx.compile for kernel fusion.
+        max_sequence_length: Maximum sequence context buffer.
+
+    Returns:
+        Tuple of (model, tokenizer, preprocessor).
+    """
+    _register_tf_mlx_converter()
+
+    import keras
+    import keras_hub
+    import mlx.core as mx
+
+    # Register stream cleanup on exit
+    if hasattr(mx, "clear_streams"):
+        atexit.register(mx.clear_streams)
+    if hasattr(mx, "compile_clear_cache"):
+        atexit.register(mx.compile_clear_cache)
+
+    snapshot_path = download_model_if_needed(repo_or_path)
+
+    print("=" * 65)
+    print(f"Loading Mr. Chatterbox from: {snapshot_path}")
+    print(f"Backend: {keras.config.backend()} | Device: {mx.default_device()} | Dtype: {dtype}")
+    print("=" * 65)
+
+    t0 = time.time()
+    try:
+        # Load directly via KerasHub's from_preset loader
+        model = keras_hub.models.Llama3CausalLM.from_preset(snapshot_path, dtype=dtype)
+        tokenizer = model.preprocessor.tokenizer
+        preprocessor = model.preprocessor
+    except Exception as e:
+        print(f"Direct preset load encountered: {e}. Falling back to explicit architecture assembly...")
+        backbone = keras_hub.models.Llama3Backbone.from_preset(snapshot_path, dtype=dtype)
+        tokenizer, preprocessor = load_tokenizer_and_preprocessor(
+            snapshot_path, sequence_length=max_sequence_length
+        )
+        model = keras_hub.models.Llama3CausalLM(backbone=backbone, preprocessor=preprocessor)
+
+    elapsed = time.time() - t0
+    params = model.count_params()
+    print(f"Model successfully loaded in {elapsed:.2f}s! Total parameters: {params:,}")
+
+    if compile_metal:
+        print("Fusing Metal decoding kernels via mx.compile(model.call_with_cache)...")
+        model.call_with_cache = mx.compile(model.call_with_cache)
+        print("Metal kernel fusion complete!")
+
+    return model, tokenizer, preprocessor
+
+
+def compute_sequence_length(
+    prompt_tokens: int,
+    max_tokens: int,
+    max_sequence_length: int = 2048,
+) -> int:
+    """Computes bucketed sequence length capped at max_sequence_length to avoid unnecessary allocation."""
+    needed = min(max(prompt_tokens + max_tokens + 32, 512), max_sequence_length)
+    return min(((needed + 511) // 512) * 512, max_sequence_length)
+
+
+async def generate_stream_tokens(
+    model: Any,
+    tokenizer: Any,
+    prompt: str,
+    max_tokens: int = 512,
+    stop_token_ids: Optional[Set[int]] = None,
+    max_sequence_length: int = 2048,
+) -> AsyncGenerator[str, None]:
+    """Asynchronously generates streamed token pieces from prompt using compiled MLX decoding."""
+    import asyncio
+    import keras
+    import mlx.core as mx
+
+    if stop_token_ids is None:
+        stop_token_ids = {123, 119}  # Default <|end|> and <|endoftext|>
+
+    raw_tokens = mx.array(tokenizer(prompt), dtype=mx.int32)
+    prompt_tokens = len(raw_tokens)
+
+    seq_len = compute_sequence_length(
+        prompt_tokens=prompt_tokens,
+        max_tokens=max_tokens,
+        max_sequence_length=max_sequence_length,
+    )
+
+    # Ensure prompt fits in buffer with budget for generation
+    min_gen_budget = min(max_tokens, 256)
+    max_prompt_allowed = max(seq_len - min_gen_budget, 1)
+    if prompt_tokens > max_prompt_allowed:
+        raw_tokens = raw_tokens[-max_prompt_allowed:]
+        prompt_tokens = len(raw_tokens)
+
+    pad_len = seq_len - prompt_tokens
+    token_ids = mx.concatenate([raw_tokens, mx.zeros((pad_len,), dtype=raw_tokens.dtype)])
+    token_ids = mx.expand_dims(token_ids, 0)
+
+    hidden_states, cache = model._build_cache(token_ids)
+    current_prompt = token_ids
+    current_cache = cache
+    index = prompt_tokens
+    max_len = min(prompt_tokens + max_tokens, seq_len)
+
+    while index < max_len:
+        cache_update_index = index - 1
+        prompt_slice = keras.ops.slice(current_prompt, [0, cache_update_index], [1, 1])
+        idx_arr = mx.array(cache_update_index, dtype=mx.int32)
+
+        logits, _, current_cache = model.call_with_cache(
+            prompt_slice,
+            current_cache,
+            idx_arr,
+        )
+        mx.eval(logits, current_cache)
+
+        next_token = int(mx.argmax(logits[:, 0, :], axis=-1).item())
+        if next_token in stop_token_ids:
+            break
+
+        piece = tokenizer.detokenize([next_token])
+        if piece and not piece.startswith("<|"):
+            yield piece
+            # Yield control back to asyncio event loop
+            await asyncio.sleep(0)
+
+        token_tensor = mx.reshape(
+            mx.array(next_token, dtype=current_prompt.dtype), (1, 1)
+        )
+        current_prompt = keras.ops.slice_update(
+            current_prompt, [0, index], token_tensor
+        )
+        index += 1
+
+
+def generate_full_text(
+    model: Any,
+    tokenizer: Any,
+    prompt: str,
+    max_tokens: int = 512,
+    stop_token_ids: Optional[Set[int]] = None,
+    max_sequence_length: int = 2048,
+) -> str:
+    """Synchronously generates the full response string for prompt."""
+    import keras
+    import mlx.core as mx
+
+    if stop_token_ids is None:
+        stop_token_ids = {123, 119}
+
+    raw_tokens = mx.array(tokenizer(prompt), dtype=mx.int32)
+    prompt_tokens = len(raw_tokens)
+
+    seq_len = compute_sequence_length(
+        prompt_tokens=prompt_tokens,
+        max_tokens=max_tokens,
+        max_sequence_length=max_sequence_length,
+    )
+
+    pad_len = seq_len - prompt_tokens
+    token_ids = mx.concatenate([raw_tokens, mx.zeros((pad_len,), dtype=raw_tokens.dtype)])
+    token_ids = mx.expand_dims(token_ids, 0)
+
+    hidden_states, cache = model._build_cache(token_ids)
+    current_prompt = token_ids
+    current_cache = cache
+    index = prompt_tokens
+    max_len = min(prompt_tokens + max_tokens, seq_len)
+
+    generated_ids: List[int] = []
+
+    while index < max_len:
+        cache_update_index = index - 1
+        prompt_slice = keras.ops.slice(current_prompt, [0, cache_update_index], [1, 1])
+        idx_arr = mx.array(cache_update_index, dtype=mx.int32)
+
+        logits, _, current_cache = model.call_with_cache(
+            prompt_slice,
+            current_cache,
+            idx_arr,
+        )
+        mx.eval(logits, current_cache)
+
+        next_token = int(mx.argmax(logits[:, 0, :], axis=-1).item())
+        if next_token in stop_token_ids:
+            break
+
+        generated_ids.append(next_token)
+
+        token_tensor = mx.reshape(
+            mx.array(next_token, dtype=current_prompt.dtype), (1, 1)
+        )
+        current_prompt = keras.ops.slice_update(
+            current_prompt, [0, index], token_tensor
+        )
+        index += 1
+
+    return tokenizer.detokenize(generated_ids)
