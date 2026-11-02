@@ -61,6 +61,9 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
+> **Note:** the MLX backend needs development builds of Keras and KerasHub, so `requirements.txt` installs
+> both from GitHub (pinned commits). Released Keras cannot load a third-party backend yet.
+
 ### 2. Interactive Terminal Chat
 
 Launch the interactive Victorian chat loop directly in your terminal:
@@ -94,7 +97,7 @@ python serve_mr_chatterbox.py --port 8000
 | `--host` | `127.0.0.1` | Host address to bind |
 | `--port` | `8000` | Port to listen on |
 | `--clean-acts` | `False` | Strip `<act:...>` tags from completions |
-| `--no-compile` | `False` | Disable `mx.compile` Metal kernel fusion |
+| `--no-compile` | `False` | Disable `mx.compile` Metal kernel fusion (it is also switched off automatically if the installed keras-mlx cannot compile the decode step) |
 
 ### Connecting OpenCode
 
@@ -125,6 +128,17 @@ curl http://localhost:8000/v1/chat/completions \
     "stream": true
   }'
 ```
+
+---
+
+## 🗣️ Generation details
+
+These follow the [model card](https://huggingface.co/tventurella/Mr.Chatterbox-2.7B-Chat) and the official Hugging Face Space:
+
+- **No system prompt by default.** The model was trained and evaluated without one; `chat.py --system "..."` adds one.
+- **Act first, chosen from the act tokens.** Each reply opens with the most likely `<act:...>` token, chosen among act tokens only; act tokens are then banned for the rest of the reply.
+- **Earlier acts are left out of the history**, as in training (keeping them makes acts "sticky").
+- **Stop-safe repetition penalty.** The penalty skips `<|end|>`, `<|endoftext|>`, the role tokens and the act tokens. Every turn in the prompt closes with `<|end|>`, so penalising it would stop the model from ending its reply.
 
 ---
 

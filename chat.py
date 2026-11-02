@@ -32,7 +32,7 @@ class ChatSession:
 
     def __init__(
         self,
-        system_prompt: str = "You are Mr. Chatterbox, an eccentric 19th-century British gentleman.",
+        system_prompt: Optional[str] = None,     # the model was evaluated without one
         show_acts: bool = True,
     ):
         self.system_prompt = system_prompt
@@ -201,6 +201,12 @@ def main():
         help="Disable mx.compile Metal kernel fusion",
     )
     parser.add_argument(
+        "--system",
+        type=str,
+        default=None,
+        help="Optional system prompt (default: none, as the model was trained and evaluated)",
+    )
+    parser.add_argument(
         "--no-acts",
         action="store_true",
         help="Hide dialogue act tags (<act:...>)",
@@ -213,7 +219,7 @@ def main():
         compile_metal=not args.no_compile,
     )
 
-    session = ChatSession(show_acts=not args.no_acts)
+    session = ChatSession(system_prompt=args.system, show_acts=not args.no_acts)
     asyncio.run(
         run_chat_loop(
             model=model,

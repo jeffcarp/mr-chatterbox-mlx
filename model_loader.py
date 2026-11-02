@@ -108,6 +108,12 @@ def load_tokenizer_and_preprocessor(
             cfg_data = json.load(f)
             bos_token = cfg_data.get("bos_token")
             eos_token = cfg_data.get("eos_token") or "<|endoftext|>"
+    # Mr. Chatterbox has no BOS token (bos_token: null). KerasHub's tokenizer puts bos into its list of
+    # unsplittable tokens, and a None in that list fails in TensorFlow ("Can't convert Python sequence
+    # with mixed types to Tensor"). Stand in with the EOS token: add_start_token=False below, so it is
+    # never inserted into a prompt.
+    if not bos_token:
+        bos_token = eos_token
 
     misc_tokens = {t for t in special_tokens if t in vocab}
     if bos_token:
@@ -189,8 +195,26 @@ def load_mr_chatterbox(
 
     if compile_metal:
         print("Fusing Metal decoding kernels via mx.compile(model.call_with_cache)...")
-        model.call_with_cache = mx.compile(model.call_with_cache)
-        print("Metal kernel fusion complete!")
+        uncompiled = model.call_with_cache
+        model.call_with_cache = mx.compile(uncompiled)
+        # Some keras-mlx builds read an array's value inside call_with_cache (slice_update calls .item()
+        # on the cache index), which mx.compile forbids ("Attempting to eval an array during function
+        # transformations"). The error only appears on the first decode step, so probe one step now and
+        # fall back to uncompiled decoding rather than failing mid-conversation.
+        try:
+            import keras
+
+            probe = mx.zeros((1, 8), dtype=mx.int32)
+            _, probe_cache = model._build_cache(probe)
+            logits, _, _ = model.call_with_cache(
+                keras.ops.slice(probe, [0, 0], [1, 1]), probe_cache, mx.array(0, dtype=mx.int32)
+            )
+            mx.eval(logits)
+            print("Metal kernel fusion complete!")
+        except Exception as e:
+            model.call_with_cache = uncompiled
+            print(f"mx.compile is not supported by this keras-mlx build ({type(e).__name__}); "
+                  "decoding without kernel fusion.")
 
     return model, tokenizer, preprocessor
 
@@ -205,25 +229,60 @@ def compute_sequence_length(
     return min(((needed + 511) // 512) * 512, max_sequence_length)
 
 
+def special_token_ids(tokenizer: Any) -> Tuple[List[int], Set[int]]:
+    """(act token ids, ids the repetition penalty must never touch) for a Mr. Chatterbox tokenizer.
+
+    The chat model writes one <act:NAME> token first in every reply, then the reply itself. Following the
+    model card (and the Hugging Face Space): the act is the most likely ACT token, chosen from act tokens
+    only, and act tokens are banned for the rest of the reply. Sampling the act like ordinary text lets a
+    plain word win that slot, and an unbanned act token can appear mid-sentence ("as far as I can<act:recall>").
+    """
+    vocab = getattr(tokenizer, "vocabulary", None) or {}
+    act_ids = sorted(int(i) for t, i in vocab.items() if isinstance(t, str) and t.startswith("<act:"))
+    exempt = set(act_ids) | {119, 123}            # <|endoftext|>, <|end|>
+    for t in ("<|user|>", "<|assistant|>", "<|system|>"):
+        if t in vocab:
+            exempt.add(int(vocab[t]))
+    return act_ids, exempt
+
+
 def sample_token_mlx(
     logits: Any,
     context_ids: Optional[List[int]] = None,
     temperature: float = 0.3,
     top_k: int = 50,
     repetition_penalty: float = 1.3,
+    exempt_ids: Optional[Set[int]] = None,
+    choose_from: Optional[List[int]] = None,
+    banned_ids: Optional[List[int]] = None,
 ) -> int:
-    """Samples next token from logits with repetition penalty, temperature, and top-k filtering in MLX."""
+    """Samples next token from logits with repetition penalty, temperature, and top-k filtering in MLX.
+
+    choose_from: return the most likely of these ids (used for the act token, first in each reply).
+    banned_ids: ids that may not be sampled (act tokens, after the first).
+    exempt_ids: ids the repetition penalty leaves alone. The chat template closes every turn with <|end|>,
+    so a penalty over the context would also penalise the stop token: the model then cannot end its reply
+    and runs on (the Hugging Face built-in penalty has the same flaw; the Space uses a stop-safe one).
+    """
     import mlx.core as mx
 
     l = logits[0, 0].astype(mx.float32)
 
-    # Apply repetition penalty to recently observed tokens
+    if choose_from:
+        idx = mx.array(choose_from, dtype=mx.int32)
+        return int(choose_from[int(mx.argmax(l[idx]).item())])
+
+    # Apply repetition penalty to recently observed tokens, never to stop/control/act tokens
     if repetition_penalty != 1.0 and context_ids:
-        unique_ids = list(set(context_ids))
-        indices = mx.array(unique_ids, dtype=mx.int32)
-        vals = l[indices]
-        new_vals = mx.where(vals > 0, vals / repetition_penalty, vals * repetition_penalty)
-        l[indices] = new_vals
+        unique_ids = [i for i in set(context_ids) if not exempt_ids or i not in exempt_ids]
+        if unique_ids:
+            indices = mx.array(unique_ids, dtype=mx.int32)
+            vals = l[indices]
+            new_vals = mx.where(vals > 0, vals / repetition_penalty, vals * repetition_penalty)
+            l[indices] = new_vals
+
+    if banned_ids:
+        l[mx.array(banned_ids, dtype=mx.int32)] = -1e9
 
     if temperature <= 0.01:
         return int(mx.argmax(l).item())
@@ -258,6 +317,7 @@ async def generate_stream_tokens(
     if stop_token_ids is None:
         stop_token_ids = {123, 119}  # Default <|end|> and <|endoftext|>
 
+    act_ids, exempt_ids = special_token_ids(tokenizer)
     raw_tokens = mx.array(tokenizer(prompt), dtype=mx.int32)
     prompt_tokens = len(raw_tokens)
 
@@ -305,6 +365,9 @@ async def generate_stream_tokens(
             temperature=temperature,
             top_k=top_k,
             repetition_penalty=repetition_penalty,
+            exempt_ids=exempt_ids,
+            choose_from=act_ids if (index == prompt_tokens and act_ids) else None,
+            banned_ids=act_ids if index > prompt_tokens else None,
         )
         if next_token in stop_token_ids:
             break
@@ -349,6 +412,7 @@ def generate_full_text(
     if stop_token_ids is None:
         stop_token_ids = {123, 119}
 
+    act_ids, exempt_ids = special_token_ids(tokenizer)
     raw_tokens = mx.array(tokenizer(prompt), dtype=mx.int32)
     prompt_tokens = len(raw_tokens)
 
@@ -389,6 +453,9 @@ def generate_full_text(
             temperature=temperature,
             top_k=top_k,
             repetition_penalty=repetition_penalty,
+            exempt_ids=exempt_ids,
+            choose_from=act_ids if (index == prompt_tokens and act_ids) else None,
+            banned_ids=act_ids if index > prompt_tokens else None,
         )
         if next_token in stop_token_ids:
             break
