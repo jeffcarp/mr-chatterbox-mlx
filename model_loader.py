@@ -195,8 +195,27 @@ def load_mr_chatterbox(
 
     if compile_metal:
         print("Fusing Metal decoding kernels via mx.compile(model.call_with_cache)...")
-        model.call_with_cache = mx.compile(model.call_with_cache)
-        print("Metal kernel fusion complete!")
+        uncompiled = model.call_with_cache
+        model.call_with_cache = mx.compile(uncompiled)
+        # Some keras-mlx builds read an array's value inside call_with_cache (slice_update calls .item()
+        # on the cache index), which mx.compile forbids ("Attempting to eval an array during function
+        # transformations"). The error only appears on the first decode step, so probe one step now and
+        # fall back to uncompiled decoding rather than failing mid-conversation.
+        try:
+            import keras
+
+            probe = mx.zeros((1, 8), dtype=mx.int32)
+            _, probe_cache = model._build_cache(probe)
+            logits, _, _ = model.call_with_cache(
+                keras.ops.slice(probe, [0, 0], [1, 1]), probe_cache, mx.array(0, dtype=mx.int32)
+            )
+            mx.eval(logits)
+            print("Metal kernel fusion complete!")
+        except Exception as e:
+            model.call_with_cache = uncompiled
+            print(f"mx.compile is not supported by this keras-mlx build ({type(e).__name__}); "
+                  "decoding without kernel fusion.")
+
 
     return model, tokenizer, preprocessor
 
