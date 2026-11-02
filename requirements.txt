@@ -1,6 +1,9 @@
 # Core Keras & MLX dependencies
-keras>=3.15.0
-keras-hub>=0.30.0
+# Keras and KerasHub from GitHub: released Keras (3.15.x) cannot load a third-party backend, so
+# KERAS_BACKEND=mlx fails with "Unable to import backend: mlx", and released KerasHub does not import
+# against development Keras ("cannot import name 'get_keras_mask'"). Pinned to commits known to work.
+keras @ git+https://github.com/keras-team/keras.git@df66bffce85194fff9d188b60cccd46aec2f6d99
+keras-hub @ git+https://github.com/keras-team/keras-hub.git@d08e6d9f0144cf12740e1f5ed0ad06b6ee056524
 mlx>=0.30.0
 keras-mlx>=0.0.1
 
