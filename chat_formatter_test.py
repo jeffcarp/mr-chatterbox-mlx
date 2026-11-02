@@ -94,3 +94,27 @@ def test_get_stop_token_ids():
     stop_ids = formatter.get_stop_token_ids(DummyTokenizer())
     assert 123 in stop_ids
     assert 119 in stop_ids
+
+
+def test_format_chat_no_system_prompt_by_default():
+    # The model was trained and evaluated without a system prompt.
+    formatter = MrChatterboxFormatter()
+    prompt = formatter.format_chat([{"role": "user", "content": "Good day."}])
+    assert prompt == "<|user|>Good day.<|end|><|assistant|>"
+
+
+def test_format_chat_strips_acts_from_history():
+    # Earlier replies are fed back without their act tokens, as in training.
+    formatter = MrChatterboxFormatter()
+    messages = [
+        {"role": "user", "content": "Good day sir"},
+        {"role": "assistant", "content": "<act:return_greeting>How do you do?"},
+        {"role": "user", "content": "Very well."},
+    ]
+    prompt = formatter.format_chat(messages)
+    assert prompt == (
+        "<|user|>Good day sir<|end|>"
+        "<|assistant|>How do you do?<|end|>"
+        "<|user|>Very well.<|end|>"
+        "<|assistant|>"
+    )

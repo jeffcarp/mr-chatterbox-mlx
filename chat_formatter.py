@@ -63,7 +63,9 @@ class MrChatterboxFormatter:
 
     def __init__(
         self,
-        default_system_prompt: Optional[str] = "You are Mr. Chatterbox, an eccentric 19th-century British gentleman.",
+        # None: the model was trained and evaluated without a system prompt (model card); an
+        # assistant-style instruction is outside its training distribution.
+        default_system_prompt: Optional[str] = None,
     ):
         self.default_system_prompt = default_system_prompt
 
@@ -98,6 +100,9 @@ class MrChatterboxFormatter:
             elif role == "user":
                 formatted_parts.append(f"<|user|>{content}<|end|>")
             elif role == "assistant":
+                # Earlier replies go back WITHOUT their act tokens: the model was trained that way
+                # (--no-prior-acts); keeping them makes acts "sticky" (one clarify invites another).
+                content = re.sub(r"<act:[A-Za-z0-9_]+>", "", content).strip()
                 formatted_parts.append(f"<|assistant|>{content}<|end|>")
             else:
                 # Fallback to user role for unknown types
