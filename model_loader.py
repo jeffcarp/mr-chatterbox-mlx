@@ -108,6 +108,12 @@ def load_tokenizer_and_preprocessor(
             cfg_data = json.load(f)
             bos_token = cfg_data.get("bos_token")
             eos_token = cfg_data.get("eos_token") or "<|endoftext|>"
+    # Mr. Chatterbox has no BOS token (bos_token: null). KerasHub's tokenizer puts bos into its list of
+    # unsplittable tokens, and a None in that list fails in TensorFlow ("Can't convert Python sequence
+    # with mixed types to Tensor"). Stand in with the EOS token: add_start_token=False below, so it is
+    # never inserted into a prompt.
+    if not bos_token:
+        bos_token = eos_token
 
     misc_tokens = {t for t in special_tokens if t in vocab}
     if bos_token:
